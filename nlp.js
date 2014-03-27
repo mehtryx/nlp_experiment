@@ -6,17 +6,18 @@ var request = require('request'),		// pull feed
 	elastical = require('elastical'),	// connect to sisyphus:9200 ( which is a host entry to our aws instance runing elasticsearch 1.0 )
 	async = require('async');			// async library to handle multiple parallel requests
 
-
+// elastical client -- Note only works because of my local host entry
+var client = new elastical.Client('sisyphus', { port: 9200 });
 
 
 // variables for controlling relevence
 var relevence_score = 0.9,
-	category_weight = .25,
-	tag_weight = .5;
+	category_weight = 2.0,
+	tag_weight = 5.0;
 
 // natural node objects initialized
 var stopwords = natural.stopwords;
-stopwords.push("its", "go", "just", "weve", "cant", "so", "hes", "not", "if", "else", "when", "where", "what", "while", "dont");
+stopwords.push("its", "go", "just", "weve", "cant", "so", "hes", "not", "if", "else", "when", "where", "what", "while", "dont", "length");
 var tokenizer = new natural.WordTokenizer();
 var NGrams = natural.NGrams;
 
@@ -41,16 +42,21 @@ function sha_hash(d) {
 	return shasum.digest('hex');
 }
 
-// tokenizes string object
+// tokenizes string object - lets redo this, lets not tokenize...just return array.
 function tokenize_term_modifier( obj ) {
-	var tokens = [];
+	//var tokens = [];
+	var terms = [];
 	obj.forEach( function(key) {
-		var temp = tokenizer.tokenize(key.title);
-		temp.forEach( function (value) {
-			tokens.push(value);
-		});
+		key = key.title.toLowerCase();
+		if ( terms.indexOf( key ) === -1 )
+			terms.push( key )
+	//	var temp = tokenizer.tokenize(key.title);
+	//	temp.forEach( function (value) {
+	//		tokens.push(value);
+	//	});
 	});
-	return tokens;
+	return terms;
+	//return tokens;
 }
 
 // custom sort for term scores
@@ -105,13 +111,15 @@ function nlp( feed, request_timing ) {
 				terms_score: []			// stores all terms with score, used to help generate trigram scores
 			},
 			term_modifiers: {
-				tags: [],				// stores all unique tags
-				categories: []			// stores all unique categories
+				tags: [],				// stores all unique tags tokenized from tag array
+				tags_raw: [],			// original tags, just lowercased, duplicates removed
+				categories: [],			// stores all unique categories tokenized from category array
+				categories_raw: []		// original categories, just lowercased, duplicates removed
 			}
 		};
 			
 		// strip html, entity codes, and new line characters
-		var cleanText = item.content.replace( /(<([^>]+)>)|&([a-zA-Z0-9#]+);|\\n/gi, "" ).toLowerCase();
+		var cleanText = item.title.replace( /(<([^>]+)>)|&([a-zA-Z0-9#]+);|\\n/gi, "" ).toLowerCase() + ' ' + item.content.replace( /(<([^>]+)>)|&([a-zA-Z0-9#]+);|\\n/gi, "" ).toLowerCase();
 		// Attach stemmer - still deciding on this.... word need to stem trigrams as well...
 		//natural.LancasterStemmer.attach();
 		//item_terms.raw_terms = cleanText.tokenizeAndStem();
@@ -120,14 +128,34 @@ function nlp( feed, request_timing ) {
 		item_terms.raw_terms = tokenizer.tokenize( cleanText );
 		
 		// tokenize and store tags
-		item_terms.term_modifiers.tags = tokenize_term_modifier( item.tags );
+		item_terms.term_modifiers.tags_raw = tokenize_term_modifier( item.tags );
+		var temp_tags = []; // remove stop words, tokenize
+		item_terms.term_modifiers.tags_raw.forEach( function (tag ) {
+			var tokens = tokenizer.tokenize( tag );
+			tokens.forEach( function ( token ) {
+				if ( temp_tags.indexOf( token ) === -1 && stopwords.indexOf( token ) === -1 ) {
+					temp_tags.push( token );
+				}
+			});
+		});
+		item_terms.term_modifiers.tags = temp_tags;
 		
 		var tag_importance_offset = 0;
 		if ( (item_terms.term_modifiers.tags.length / item_terms.raw_terms.length * 100.0) > 80.0 )
 			tag_importance_offset =- tag_weight;  // too many tags, no longer important, negats tag offset in term score
 		
 		// tokenize and store categories
-		item_terms.term_modifiers.categories = tokenize_term_modifier( item.categories );
+		item_terms.term_modifiers.categories_raw = tokenize_term_modifier( item.categories );
+		var temp_cat = [];
+		item_terms.term_modifiers.categories_raw.forEach( function( category ) { 
+			var tokens = tokenizer.tokenize( category );
+			tokens.forEach( function ( token ) {
+				if ( temp_cat.indexOf( token ) === -1 && stopwords.indexOf( token ) === -1 ) {
+					temp_cat.push( token );
+				}
+			});
+		});
+		item_terms.term_modifiers.categories = temp_cat;
 		
 		// process each token, if word is not a duplicate, not in the stopwords and has a length > 1 we add it to wordTokens
 		item_terms.raw_terms.forEach( function( token ) {
@@ -147,13 +175,15 @@ function nlp( feed, request_timing ) {
 			var score = tfidf.tfidf( term, doc_id );
 			
 			// check if word is in tags
-			if ( item_terms.term_modifiers.tags.indexOf(  term ) !== -1 )
-				score += tag_weight + tag_importance_offset;
+			if ( item_terms.term_modifiers.tags.indexOf( term ) !== -1 ) {
+				score += tag_weight;
+			}
 				
-			if ( item_terms.term_modifiers.categories.indexOf( term ) !== -1)
+			if ( item_terms.term_modifiers.categories.indexOf( term ) !== -1) {
 				score += category_weight;
+			}
 			
-			if ( score >= relevence_score && termcounter < 20 ) {
+			if ( score >= relevence_score ) {
 				item_terms.tfidf_terms.score.push( { term: term, tfidf: score } );
 				termcounter++;
 			}
@@ -165,7 +195,7 @@ function nlp( feed, request_timing ) {
 		
 		// sort scores in descending order
 		item_terms.tfidf_terms.score = score_sort( item_terms.tfidf_terms.score );
-		
+		item_terms.tfidf_terms.score = item_terms.tfidf_terms.score.slice(0, 20);
 		
 		// N-Grams
 		item_ngrams.raw_trigrams = NGrams.trigrams( cleanText );
@@ -199,12 +229,17 @@ function nlp( feed, request_timing ) {
 		});
 		item_ngrams.tfidf_trigrams.trigrams_score = temp_trigram_score; // sorts this list
 		
+		// now we are going to flatten this out....
+		var flattened_terms = '';
+		var flattened_array = []; //temp holding to route out duplicates
+		
 		// Hash generation
 		//
 		// First Hash - which is the hash of high scoring words in item_terms.tfidf_terms.score[{term: , score: }]
 		var firstHashSource = '', firstHash;
 		item_terms.tfidf_terms.score.forEach( function( term ) {
 			firstHashSource += term.term;
+			flattened_terms += term.term + ' ';
 		});
 		firstHash = sha_hash(firstHashSource);
 		//console.log('1 - ' + firstHash);
@@ -215,13 +250,14 @@ function nlp( feed, request_timing ) {
 		secondHash = sha_hash(secondHashSource);
 		//console.log('2 - ' + secondHash);
 		
-		
+				
 		// Third Hash - which is the hash of the high scoring ngrams in item_ngrams.tfidf_trigrams.trigrams_score[]
 		var thirdHashSource = '', thirdHash;
 		var high_scoring_ngrams= []; // processing this at same time to make a clean array for our sav function
 		bySortedValue( item_ngrams.tfidf_trigrams.trigrams_score, function ( key, value ) {
 			thirdHashSource += key + '|' + value;
 			high_scoring_ngrams.push( { ngram: key, tfidf: value });
+			flattened_terms = key + ' ' + flattened_terms; // pushing these onto front.
 		});
 		thirdHash = sha_hash(thirdHashSource);
 		//console.log('3 - ' + thirdHash);
@@ -229,8 +265,16 @@ function nlp( feed, request_timing ) {
 		// end of this item processing
 		sep();
 		
+		// split out, check for duplicates and delete.
+		flattened_terms.split(' ').forEach( function (term ) {
+			if ( flattened_array.indexOf( term ) === -1 )
+				flattened_array.push( term);
+		});
+		
+		var final_terms = flattened_array.join(' ') + ' ' + item_terms.term_modifiers.tags_raw.join(' ') + ' ' + item_terms.term_modifiers.categories_raw.join(' ');
+
 		// for testing lets save these as json objects into a text file.  But first we'll need to make a larger object containing all of the data
-		jsonData.posts.push( {
+		var jsonDoc = {
 			postid: item.id,
 			title: item.title,
 			hashes: {
@@ -238,12 +282,61 @@ function nlp( feed, request_timing ) {
 				ngram: secondHash,
 				scored_ngram: thirdHash
 			},
-			high_scoring_ngrams: high_scoring_ngrams,
-			high_scoring_terms: item_terms.tfidf_terms.score,
-			tags: item_terms.term_modifiers.tags,
-			categories: item_terms.term_modifiers.categories
-		});
+			keywords: final_terms
+		};
+		jsonData.posts.push(jsonDoc);
 		
+		// now elastical
+		
+		//termmap
+		theTerms(item_terms);
+		
+		// Does it exist?
+		var searchQuery = {
+			"index": "cortex",
+			"query": {
+				"bool": {
+					"must": [
+					{
+						"term": {
+							"posts.postid": jsonDoc.postid
+						}
+					},
+					{
+						"term": {
+							"posts.hashes.term": jsonDoc.hashes.term
+						}
+					},
+					{
+						"term": {
+							"posts.hashes.ngram": jsonDoc.hashes.ngram
+						}
+					},
+					{
+						"term": {
+							"posts.hashes.scored_ngram": jsonDoc.hashes.scored_ngram
+						}
+					}
+					],
+					"must_not": [],
+					"should": []
+				}
+			},
+			"from": 0,
+			"size": 10,
+			"sort": [],
+			"facets": {}
+		};
+		client.search( searchQuery, function( err, res) {
+			if ( res.total <= 0 && err === null ) {
+				// then this doesn't exist....good
+						client.index( 'cortex', 'posts', jsonDoc, function(err, res) {
+							if (err)
+								console.log(err);
+						});
+			}
+		});
+
 	});
 	
 }
@@ -251,7 +344,7 @@ function nlp( feed, request_timing ) {
 function pullFeed( paged, callback ) {
 	var timing = new Date().getTime();
 	var url = 'http://smrt.wpengine.com/?feed=json&jsonp&tc=' + timing + ( paged !== 1 ? '&paged=' + paged : '');
-	debugger;
+	
 	var status = {
 		url: url,
 		request_time: '',
@@ -265,61 +358,111 @@ function pullFeed( paged, callback ) {
 			status.error = error;
 		}
 		else {
-			var feed = JSON.parse( body );
-			nlp( feed, request_timing );
-			var finished_time = new Date().getTime();
-			status.finished_time = 'Total Elapsed time: ' + (finished_time - timing)/1000.0 + 's  Request time: ' +  (request_timing - timing)/1000.0 + 's  NLP Time: ' + (finished_time - request_timing)/1000.0 + 's';
+			try {
+				var feed = JSON.parse( body );
+				nlp( feed, request_timing );
+				var finished_time = new Date().getTime();
+				status.finished_time = 'Total Elapsed time: ' + (finished_time - timing)/1000.0 + 's  Request time: ' +  (request_timing - timing)/1000.0 + 's  NLP Time: ' + (finished_time - request_timing)/1000.0 + 's';
+				callback( null, status );
+			}
+			catch (err) {
+				callback( err, null );
+			}
 		}
-		callback( status );
+
+	});
+}
+console.log("\n\n=========================================================================================\n\n");
+
+function doRequest(start, callback) {
+	pullFeed( start , function( err, results ) {
+		if ( err ) {
+			console.log("failed, retrying request " + start);
+			doRequest( start, function( err, result ) {
+				callback( null, start);
+			});
+		}
+		else {
+			console.log( "\t\tRequest " + start + " results:\n\nurl: " + results.url + "\n" + results.request_time + "\n" + results.finished_time + "\nErrors: " + results.error );
+			callback( null, start );
+		}
 	});
 }
 
+function populate(start){
+	console.log("trying request " + start );
+	async.series( [
+		function(callback) {
+			doRequest( start, function( err, result ) {
+				callback( null, start);
+			});
+		}
+		],
+		function(err, result) {
+			if (start<1)
+				populate(start+1);
+		}
+	);
+}
 
-// run all five requests async, then output to file in final callback
-async.parallelLimit([
-	function(callback) {
-		pullFeed( 1, function( results ) {
-			console.log( "Request 1 results:\n\nurl: " + results.url + "\n" + results.request_time + "\n" + results.finished_time + "\nErrors: " + results.error );
-			callback( null, 1 );
-		});
-	},
-	function(callback) {
-		pullFeed( 2, function( results ) {
-			console.log( "Request 2 results:\n\nurl: " + results.url + "\n" + results.request_time + "\n" + results.finished_time + "\nErrors: " + results.error );
-			callback( null, 2 );
-		});
-		
-	},
-	function(callback) {
-		pullFeed( 3, function( results ) {
-			console.log( "Request 3 results:\n\nurl: " + results.url + "\n" + results.request_time + "\n" + results.finished_time + "\nErrors: " + results.error );
-			callback( null, 3 );
-		});
-		
-	},
-	function(callback) {
-		pullFeed( 4, function( results ) {
-			console.log( "Request 4 results:\n\nurl: " + results.url + "\n" + results.request_time + "\n" + results.finished_time + "\nErrors: " + results.error );
-			callback( null, 4 );
-		});
-		
+function theTerms( item_terms ) {
+	// lets build our term map.
+	//starting with tags
+	var temp_terms = []; // store terms in a index of the term id and score as value
+	var termmap = {
+		"terms": []
+	};
+	
+	// construct initial structure of tags and categories as a 1 to 1 map of score and tag name
+	item_terms.term_modifiers.tags_raw.forEach( function ( tag ) {
+		temp_terms[tag] = { score: 1.0 , relationships: [] }; // default importance to each other ( 1 is equal importance, or indifferent ) 
+	});
+	item_terms.term_modifiers.categories_raw.forEach( function (category ) {
+		if (temp_terms[category] !== undefined ) {
+			temp_terms[category].score = 1/0.33; // hard coded since we know if it is there its a tag with a value of 1, 1/0.33 = 3.030303
+		}
+		else {
+			temp_terms[category] = { score: 0.33, relationships: [] }; // default importance of categories is 1/3 that of tags
+		}
+	});
+	
+	item_terms.tfidf_terms.score.forEach( function( term) {
+		if ( temp_terms[term.term] !== undefined ) {
+			// exists, so lets mod it.  new value = term_score/old_score * old_score  so score adjusts based on importance of word
+			temp_terms[term.term].score = ( term.tfidf / temp_terms[term.term].score ) * temp_terms[term.term].score;
+		}
+		else {
+			temp_terms[term.term] = { score: term.tfidf, relationships: [] };
+		}
+	});
+	
+	// now we nest two loops to add relationships
+	for (var term in temp_terms) {
+		var related = [];
+		for (var secondTerm in temp_terms){
+			var relatedScore = temp_terms[secondTerm].score / temp_terms[term].score * temp_terms[secondTerm].score;
+			related.push( 
+				{
+					related_id: secondTerm,
+					score: relatedScore
+				}
+			);
+		}
+		termmap.terms.push(
+			{
+				id: term,
+				relationships: related
+			}
+		);
 	}
-	/*,
-	function(callback) {
-		pullFeed( 5, function( results ) {
-			console.log( "Request 5 results:\n\nurl: " + results.url + "\n" + results.request_time + "\n" + results.finished_time + "\nErrors: " + results.error );
-			callback( null, 5 );
-		});
-		
-	} */
-	],
-	1, // limit to 1 task at a time...adjust for performance tuning.
-	function( err, results ) {
-		// final callback
-		var output = JSON.stringify(jsonData, null, 4);
-		var outputFilename = 'nlp.json';
-		fs.writeFileSync( outputFilename, output );
-		console.log('Results saved to ./nlp.json');
-		process.exit();	
-	}
-);
+	
+	console.log("\n\n---------=========-----------============----------========----------\n\n");
+	console.log(util.inspect(termmap,false,null));
+	console.log("\n\n");
+}
+
+
+
+populate(1);
+
+
