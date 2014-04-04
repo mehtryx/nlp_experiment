@@ -4,6 +4,7 @@ var request = require('request'),		// pull feed
 	crypto = require('crypto'),			// generate sha1 hashes for document uniqueness checks
 	fs = require('fs'),					// fs library used to save json data for local validation
 	elastical = require('elastical'),	// connect to sisyphus:9200 ( which is a host entry to our aws instance runing elasticsearch 1.0 )
+	_ = require('underscore'),			// Used to iterate through json objects and find related values quickly
 	async = require('async');			// async library to handle multiple parallel requests
 
 // elastical client -- Note only works because of my local host entry
@@ -169,7 +170,6 @@ function nlp( feed, request_timing ) {
 		// calculate tfidf scores
 		var tfidf = new natural.TfIdf();
 		tfidf.addDocument( cleanText );
-		tfidf.addDocument( stopwords.join(' ') ); // adding a document full of stop words to allow idf to compute without LOG 1/1 = 0
 		var termcounter = 0;
 		item_terms.tfidf_terms.terms.forEach( function ( term ) {
 			var score = tfidf.tfidf( term, doc_id );
@@ -289,9 +289,11 @@ function nlp( feed, request_timing ) {
 		// now elastical
 		
 		//termmap
+		
 		theTerms(item_terms);
 		
 		// Does it exist?
+/*
 		var searchQuery = {
 			"index": "cortex",
 			"query": {
@@ -328,14 +330,20 @@ function nlp( feed, request_timing ) {
 			"facets": {}
 		};
 		client.search( searchQuery, function( err, res) {
-			if ( res.total <= 0 && err === null ) {
+			//console.log(util.inspect(searchQuery,false,null));
+			if ( res !== null && err === null ) {
 				// then this doesn't exist....good
 						client.index( 'cortex', 'posts', jsonDoc, function(err, res) {
+							console.log("index story " + jsonDoc.postid);
 							if (err)
 								console.log(err);
 						});
 			}
+			else {
+				//console.log( res + ':' + err);
+			}
 		});
+		*/
 
 	});
 	
@@ -351,6 +359,7 @@ function pullFeed( paged, callback ) {
 		error: '',
 		finished_time: ''
 	};
+
 	request( { uri: url }, function( error, response, body ) {
 		var request_timing = new Date().getTime();
 		status.request_time = 'Request time: ' + ( request_timing - timing )/1000.0 + ' seconds';
@@ -372,25 +381,25 @@ function pullFeed( paged, callback ) {
 
 	});
 }
-console.log("\n\n=========================================================================================\n\n");
+//console.log("\n\n=========================================================================================\n\n");
 
 function doRequest(start, callback) {
 	pullFeed( start , function( err, results ) {
 		if ( err ) {
-			console.log("failed, retrying request " + start);
+			//console.log("failed, retrying request " + start);
 			doRequest( start, function( err, result ) {
 				callback( null, start);
 			});
 		}
 		else {
-			console.log( "\t\tRequest " + start + " results:\n\nurl: " + results.url + "\n" + results.request_time + "\n" + results.finished_time + "\nErrors: " + results.error );
+			//console.log( "\t\tRequest " + start + " results:\n\nurl: " + results.url + "\n" + results.request_time + "\n" + results.finished_time + "\nErrors: " + results.error );
 			callback( null, start );
 		}
 	});
 }
 
 function populate(start){
-	console.log("trying request " + start );
+	//console.log("trying request " + start );
 	async.series( [
 		function(callback) {
 			doRequest( start, function( err, result ) {
@@ -399,66 +408,135 @@ function populate(start){
 		}
 		],
 		function(err, result) {
-			if (start<1)
+			if (start<138)
 				populate(start+1);
 		}
 	);
 }
 
 function theTerms( item_terms ) {
+	
 	// lets build our term map.
 	//starting with tags
 	var temp_terms = []; // store terms in a index of the term id and score as value
-	var termmap = {
-		"terms": []
-	};
+	var terms_to_query = [];
+
 	
 	// construct initial structure of tags and categories as a 1 to 1 map of score and tag name
 	item_terms.term_modifiers.tags_raw.forEach( function ( tag ) {
-		temp_terms[tag] = { score: 1.0 , relationships: [] }; // default importance to each other ( 1 is equal importance, or indifferent ) 
+		var tag_hash=sha_hash( tag ); // convert to sha
+		temp_terms[tag_hash] = { term: tag, score: 1.0 , relationships: [] }; // default importance to each other ( 1 is equal importance, or indifferent ) 
+		terms_to_query.push( tag_hash );
 	});
 	item_terms.term_modifiers.categories_raw.forEach( function (category ) {
-		if (temp_terms[category] !== undefined ) {
-			temp_terms[category].score = 1/0.33; // hard coded since we know if it is there its a tag with a value of 1, 1/0.33 = 3.030303
+		var cat_hash = sha_hash( category )
+		if (temp_terms[cat_hash] !== undefined ) {
+			temp_terms[cat_hash].score = 1/0.33; // hard coded since we know if it is there its a tag with a value of 1, 1/0.33 = 3.030303
 		}
 		else {
-			temp_terms[category] = { score: 0.33, relationships: [] }; // default importance of categories is 1/3 that of tags
+			temp_terms[cat_hash] = { term: category, score: 0.33, relationships: [] }; // default importance of categories is 1/3 that of tags
+			terms_to_query.push( cat_hash );
 		}
 	});
 	
 	item_terms.tfidf_terms.score.forEach( function( term) {
-		if ( temp_terms[term.term] !== undefined ) {
+		var term_hash = sha_hash( term.term );
+		if ( temp_terms[term_hash] !== undefined ) {
 			// exists, so lets mod it.  new value = term_score/old_score * old_score  so score adjusts based on importance of word
-			temp_terms[term.term].score = ( term.tfidf / temp_terms[term.term].score ) * temp_terms[term.term].score;
+			temp_terms[term_hash].score = ( term.tfidf / temp_terms[term_hash].score ) * temp_terms[term_hash].score;
 		}
 		else {
-			temp_terms[term.term] = { score: term.tfidf, relationships: [] };
+			temp_terms[term_hash] = { term: term.term, score: term.tfidf, relationships: [] };
+			terms_to_query.push( term_hash );
 		}
 	});
 	
-	// now we nest two loops to add relationships
-	for (var term in temp_terms) {
-		var related = [];
-		for (var secondTerm in temp_terms){
-			var relatedScore = temp_terms[secondTerm].score / temp_terms[term].score * temp_terms[secondTerm].score;
-			related.push( 
-				{
-					related_id: secondTerm,
-					score: relatedScore
-				}
-			);
-		}
-		termmap.terms.push(
-			{
-				id: term,
-				relationships: related
-			}
-		);
-	}
 	
-	console.log("\n\n---------=========-----------============----------========----------\n\n");
-	console.log(util.inspect(termmap,false,null));
-	console.log("\n\n");
+	// build query to get all the current terms from elastic that match the list we have here.
+
+	var querystring_query = terms_to_query.join(' OR ');
+	var term_query = {
+		"index": "cortex",
+		"query": {
+			"bool": {
+				"must": [
+					{
+						"query_string": {
+							"default_field": "terms.id",
+							"query": querystring_query
+						}
+					}
+				],
+				"must_not": [],
+				"should": []
+			},
+			"from": 0,
+			"size": 10,
+			"sort": [],
+			"facets": {}
+		}
+	};
+	
+	async.series([
+		function ( callback ) {
+			client.search( term_query, function( err, res) {
+				if ( res !== null && err === null ) {
+					var termmap = [], counter = 0;
+					res.hits.forEach( function ( hit ) {
+						var term_id = hit._source.id;
+						if ( temp_terms[term_id] !== undefined ) {
+							// existed so we store the relationship
+							temp_terms[term_id].relationships = hit._source.relationships;
+						}
+					});
+					for (var term in temp_terms) {
+						var related = [];
+						for ( var secondTerm in temp_terms ){
+							var relatedScore = temp_terms[secondTerm].score / temp_terms[term].score * temp_terms[secondTerm].score;
+							if ( temp_terms[term].relationships !== undefined ) {
+								var relatedItem = _.findWhere( temp_terms[term].relationships, { related_id: secondTerm } );
+								if (relatedItem !== undefined ) {
+									var oldScore = relatedScore;
+									// term existed, we have relationship to second term already so lets mod the score
+									relatedScore = relatedItem.related_score / relatedScore * relatedItem.related_score;
+									if (relatedScore !== oldScore) {
+										console.log("Modified score, term: " + temp_terms[term].term + " -> " + temp_terms[secondTerm].term + " [old score = " + oldScore + " new score = " + relatedScore + "]" );
+									}
+									else {
+										console.log("Score Unchanged, term: " + temp_terms[term].term + " -> " + temp_terms[secondTerm].term + " score = " + oldScore );
+									}
+									
+								}
+								else {
+									console.log("New scored term: " + temp_terms[term].term + " -> " + temp_terms[secondTerm].term + " score = " + relatedScore ); 
+								}
+							}
+							related.push( { related_id: secondTerm, related_term: temp_terms[secondTerm].term, related_score: relatedScore } );
+						}
+						termmap.push( { "index": { _index: "cortex", _type: "terms", _id: term, data: { id: term, term: temp_terms[term].term, relationships: related } } } );
+					}
+					callback( null, termmap);
+				}
+				else {
+					callback( null, null);
+				}
+			});
+		}
+		],
+		function(err, result) {
+			// do the bulk insert now
+			if ( result !== null ) {
+			//	console.log( util.inspect( result, false, null ) );
+				var results = result[0], counter=results.length;
+				client.bulk( results, function (err, res) {
+					if (err) {
+						console.log("ERROR - " + err);
+					}
+					//console.log("response: " + util.inspect(res) + " err: " + err);
+				});
+			}
+		}
+	);
 }
 
 
