@@ -64,7 +64,6 @@ for ( var doc = 0; doc < docLength; doc++ ) {
 			var score = tfidf.tfidf( term , doc ); // scores term in relation to the document it exists
 			if ( score >= ( median + stdDev*1.5 ) ) { // allow terms with scores higher than one and a half standard deviations above average
 				terms[termCounter] = { term: term, score:score };
-			//	console.log( term + " - " + score );
 				termCounter++;
 			}
 		}

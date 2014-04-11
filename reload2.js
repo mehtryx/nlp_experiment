@@ -46,7 +46,7 @@ for ( var doc = 0; doc < docLength; doc++ ) {
 		termScores.push( score );
 		keywords.push( term );
 	}
-	docList.keywords = keywords; // saves all the keywords for the document into this object.
+	docList[doc].keywords = keywords; // saves all the keywords for the document into this object.
 
 	// Now query elasticsearch to populate the termMap object prior to score computation.
 	
@@ -63,7 +63,6 @@ for ( var doc = 0; doc < docLength; doc++ ) {
 		var score = tfidf.tfidf( term , doc ); // scores term in relation to the document it exists
 		if ( score >= ( median + stdDev*1.5 ) ) { // allow terms with scores higher than one and a half standard deviations above average
 			terms[termCounter] = { term: term, score:score };
-		//	console.log( term + " - " + score );
 			termCounter++;
 		}
 	}
@@ -77,12 +76,15 @@ for ( var doc = 0; doc < docLength; doc++ ) {
 			findTerm = {
 				index: termsInMap,
 				hash: sha_hash( terms[primaryTerm].term ),
+				id: sha_hash( terms[primaryTerm].term ),
 				term: terms[primaryTerm].term,
-				score: terms[primaryTerm].score,
+				score: 0,
+				scores: [],
 				relatedTerms: []
 			};
 			termsInMap++; // increment for next insert point
 		}
+		findTerm.scores.push( terms[primaryTerm].score );
 		
 		for ( var secondaryTerm=0; secondaryTerm<termCounter; secondaryTerm++ ) {
 			
@@ -99,6 +101,8 @@ for ( var doc = 0; doc < docLength; doc++ ) {
 			}
 		}
 		termMap[findTerm.index] = findTerm;
+		//console.log( termMap[findTerm.index] );
+
 	}
 	console.log("=================================================================");
 } // end main for loop
@@ -118,11 +122,11 @@ function esTerms( start, callback ) {
 		function ( callback ) {
 			// first step lets query elastic search for our terms
 			var termsToQuery = [], termCounter = start;
-			for ( var term=start; term<start+10 && term<termsInMap; term++ ) {
+			for ( var term=start; term<(parseInt(start)+10) && term<termsInMap; term++ ) {
 				termsToQuery.push( termMap[term].hash );
-				termCounter++; // returned as result to track next term processed/
+				termCounter++; // returned as result to track next term processed
 			}
-			var querystringQuery = termsToQquery.join(' OR ');
+			var querystringQuery = termsToQuery.join(' OR ');
 			var termQuery = {
 				"index": "cortex",
 				"query": {
@@ -152,6 +156,7 @@ function esTerms( start, callback ) {
 						// Is term present in both ES and termMap?
 						var termToModify =  _.findWhere( termMap, { term: termResult._source.term} );
 						if ( termToModify !== undefined ) {
+							termMap[termToModify.index].scores.push( termResult._source.score );
 							
 							// Is related term present in both ES and termMap?
 							for( relatedTerm in termResult._source.relatedTerms ){
@@ -175,36 +180,156 @@ function esTerms( start, callback ) {
 		}
 		],
 		function (err, results) {
-			if ( err === null && results < termsInMap ) {
+			if ( err === null && results < 200 ) { //termsInMap ) {
 				esTerms( results ); // next iteration
 			}
 			else if ( results === start ){
 				esTerms( start ); // retry
 			}
 			else {
-				debugger; // at this point all terms should have been processed and we now need to do the actual scoring.
+				// at this point all terms should have been processed and we now need to do the actual scoring.
 				scoreTerms();
-				// end of program
-				console.log( "\n\n=====================================\n" + loadedTimeResult + "\n" + termsTimeResult );		
 			}
 		});
-	);
 }
 
 function scoreTerms() {
 	// step one, lets build scoring logic.  Step two we'll make an asycn recursive function to upload results to ES
-	for( term in termMap ) {
-		for ( related in term.relatedTerms ) {
-			var scoreDeviation = math.std( related.scores ), relatedScore = 0;
-			if ( math.max( related.scores ) === term.score ) {
-				relatedScore = term.score - ( scoreDeviation );
+	for( var t = 0; t<termsInMap; t++) {
+		console.log(t)
+		var term = termMap[t];
+		var relatedCount = _.size( term.relatedTerms );
+		for ( var r=0; r< relatedCount; r++ ) {
+			var related = term.relatedTerms[r];
+			var relatedScore = 0;
+			
+			// racu
+			term.score = math.max( term.scores );
+			var scores = _.union([term.score], related.scores );
+			if ( math.max( scores ) === term.score ) {
+				relatedScore = term.score - ( math.std( scores ) );
 			}
 			else {
-				relatedScore = term.score + ( scoreDeviation );
+				relatedScore = term.score + ( math.std( scores ) );
 			}
 			termMap[term.index].relatedTerms[related.index].score = relatedScore;
 		}
 	}
+	debugger;
+	//async_upload( 0, 0 ); // start the upload!!!
+	upload_docs();
+	debugger;
+	upload_terms();
+}
+
+function async_upload(docX, termX) {
+	async.series( {
+		doc: function( callback ) {
+			var docListSize = _.size( docList );
+			
+			if ( docX < docListSize && docX >= 0 ) {
+				var jsonData = {
+					postID: docList[docX].postID,
+					title: docList[docX].title,
+					author: docList[docX].author
+				}
+				var esID = sha_hash( JSON.stringify( jsonData ) );
+				jsonData.id = esID;
+				jsonData.keywords = docList[docX].keywords;
+
+				client.index( 'cortex', 'posts', jsonData, function( err, res ) {
+					if ( err ) {
+						callback( err, docX )
+					}
+					else {
+						console.log("index story " + jsonData.postID);
+						callback( null, null );
+					}
+				});
+			}
+			else {
+				callback( null, -1 );
+			}
+		},
+		term: function( callback ) {
+			if ( termX < termsInMap && termX >= 0 ) {
+
+			}
+			else {
+				callback( null, -1 );
+			}
+		}
+	},
+	function(err, results) {
+		// results should be : { doc: docX+1, term: termX+1 } on a successful completion
+		if ( err ) {
+			console.log( err );
+			async_upload( docX, termX ); // call same again...
+		}
+		else {
+			var nextDocX = (results.doc !== -1) ? parseInt( results.doc ) + 1 : -1,
+				nextTermX = (results.term !== -1 ) ? parseInt( results.term ) + 1 : -1;
+			async_upload( nextDocX, nextTermX );
+		}
+	});
+	
+}
+
+function upload_docs() {
+	var docListSize = _.size( docList );
+	var docX = 0;
+	async.whilst( 
+		function() { return docX < docListSize; }, // test condition
+		function( callback ) {
+			var jsonData = {
+				postID: docList[docX].postID,
+				title: docList[docX].title,
+				author: docList[docX].author
+			};
+			var esID = sha_hash( JSON.stringify( jsonData ) );
+			jsonData.id = esID;
+			jsonData.keywords = docList[docX].keywords.join(' ');
+			client.index( 'cortex', 'posts', jsonData, function( err, res ) {
+				if ( err ) {
+					callback( err );
+				}
+				else {
+					console.log( "index post " + docList[docX].postID );
+					docX++;
+					setTimeout( callback, 100 ); // pause 100 ms between requests...makes it less likely to overwhelm es server http requests
+				}
+			});
+		},
+		function( err ) {
+			// error occured if err not undefined
+			if ( err )
+				debugger;
+		}
+	);
+}
+
+function upload_terms(){
+	var termX = 0;
+	async.whilst(
+		function() { return termX < termsInMap; }, //test condition
+		function( callback ) {
+			client.index( 'cortex', 'terms', termMap[termX], function( err, res ) {
+				if ( err ) {
+					callback( err );
+				}
+				else {
+					console.log( "index term " + termMap[termX].term );
+					termX++;
+					setTimeout( callback, 100 ); // pause 100 ms again...
+				}
+			});
+		},
+		function( err ) {
+			// error occured iff err not undefined
+			if ( err )
+				debugger;
+		}
+	);
 }
 
 esTerms( 1 );
